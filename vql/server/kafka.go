@@ -18,37 +18,6 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-/*
-Package server implements the `kafka` VQL plugin, which streams rows
-from a VQL query to one or more Kafka brokers.
-
-mTLS is supported via the ClientCert / ClientKey / RootCA PEM fields.
-The plugin is intentionally thin: it does NOT include a consumer, offset
-management, or schema registry – it is a fire-and-forget producer that
-mirrors the pattern of the existing `elastic` plugin.
-
-Usage example (VQL):
-
-	SELECT * FROM kafka(
-	    query  = { SELECT * FROM watch_monitoring(artifact="Windows.Events.ProcessCreation") },
-	    brokers= ["broker1:9093", "broker2:9093"],
-	    topic  = "velociraptor",
-	    root_ca     = RootCA,
-	    client_cert = ClientCert,
-	    client_key  = ClientKey,
-	    threads     = 4,
-	    chunk_size  = 200
-	)
-
-Each row is serialised as a JSON object and published as a single Kafka
-message.  The Kafka message key is set to the artifact name when the
-`_artifact` column is present, otherwise it is left empty.
-
-Rows emitted by this plugin have the shape:
-  - Sent      int   – number of messages sent in the batch
-  - Errors    int   – number of errors in the batch
-  - Error     string – last error string (empty on success)
-*/
 package server
 
 import (
@@ -71,68 +40,28 @@ import (
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
-// ---------------------------------------------------------------------------
-// Plugin args
-// ---------------------------------------------------------------------------
-
 type _KafkaPluginArgs struct {
-	// Query whose rows are published to Kafka.
-	Query vfilter.StoredQuery `vfilter:"required,field=query,doc=Source for rows to upload."`
+	Query     vfilter.StoredQuery `vfilter:"required,field=query,doc=Source for rows to upload."`
+	Brokers   []string            `vfilter:"required,field=brokers,doc=A list of Kafka broker addresses (host:port)."`
+	Topic     string              `vfilter:"required,field=topic,doc=The Kafka topic to publish messages to."`
+	ChunkSize int64               `vfilter:"optional,field=chunk_size,doc=Batch this many rows per Kafka write (default 100)."`
+	Threads   int64               `vfilter:"optional,field=threads,doc=How many producer threads to run (default 1)."`
+	WaitTime  int64               `vfilter:"optional,field=wait_time,doc=Flush incomplete batches after this many seconds (default 2)."`
 
-	// Kafka broker addresses, e.g. ["broker1:9093", "broker2:9093"].
-	Brokers []string `vfilter:"required,field=brokers,doc=A list of Kafka broker addresses (host:port)."`
-
-	// Destination topic.
-	Topic string `vfilter:"required,field=topic,doc=The Kafka topic to publish messages to."`
-
-	// Optional: how many rows to batch before flushing to Kafka.
-	// Defaults to 100.
-	ChunkSize int64 `vfilter:"optional,field=chunk_size,doc=Batch this many rows per Kafka write (default 100)."`
-
-	// Optional: number of producer goroutines.  Defaults to 1.
-	Threads int64 `vfilter:"optional,field=threads,doc=How many producer threads to run (default 1)."`
-
-	// Optional: maximum time to wait before flushing an incomplete batch.
-	// Defaults to 2 seconds.
-	WaitTime int64 `vfilter:"optional,field=wait_time,doc=Flush incomplete batches after this many seconds (default 2)."`
-
-	// mTLS – client certificate (PEM).
 	ClientCert string `vfilter:"optional,field=client_cert,doc=PEM-encoded client certificate for mTLS."`
+	ClientKey  string `vfilter:"optional,field=client_key,doc=PEM-encoded client private key for mTLS."`
+	RootCA     string `vfilter:"optional,field=root_ca,doc=PEM-encoded root CA certificate(s) for verifying the broker TLS certificate."`
+	SkipVerify bool   `vfilter:"optional,field=skip_verify,doc=Disable TLS certificate verification (insecure)."`
 
-	// mTLS – client private key (PEM).
-	ClientKey string `vfilter:"optional,field=client_key,doc=PEM-encoded client private key for mTLS."`
-
-	// mTLS – root CA bundle (PEM) used to verify the broker certificate.
-	// If omitted the system root pool is used.
-	RootCA string `vfilter:"optional,field=root_ca,doc=PEM-encoded root CA certificate(s) for verifying the broker TLS certificate."`
-
-	// Skip TLS verification entirely (insecure, not recommended).
-	SkipVerify bool `vfilter:"optional,field=skip_verify,doc=Disable TLS certificate verification (insecure)."`
-
-	// Kafka required-acks setting: 0 = none, 1 = leader, -1 = all (default).
-	RequiredAcks int `vfilter:"optional,field=required_acks,doc=Kafka required-acks value: 0=none 1=leader -1=all (default -1)."`
-
-	// Optional: SASL username (PLAIN mechanism).  mTLS and SASL can coexist.
-	SASLUsername string `vfilter:"optional,field=sasl_username,doc=SASL/PLAIN username (optional, use alongside mTLS or alone)."`
-	SASLPassword string `vfilter:"optional,field=sasl_password,doc=SASL/PLAIN password."`
-
-	// Optional compression: none | gzip | snappy | lz4 | zstd.
-	Compression string `vfilter:"optional,field=compression,doc=Message compression codec: none|gzip|snappy|lz4|zstd (default none)."`
+	RequiredAcks int    `vfilter:"optional,field=required_acks,doc=Kafka required-acks: 0=none 1=leader -1=all (default -1)."`
+	Compression  string `vfilter:"optional,field=compression,doc=Message compression: none|gzip|snappy|lz4|zstd (default none)."`
 }
-
-// ---------------------------------------------------------------------------
-// Result row emitted by the plugin
-// ---------------------------------------------------------------------------
 
 type _KafkaUploadResponse struct {
 	Sent   int
 	Errors int
 	Error  string
 }
-
-// ---------------------------------------------------------------------------
-// Plugin implementation
-// ---------------------------------------------------------------------------
 
 type _KafkaPlugin struct{}
 
@@ -148,7 +77,6 @@ func (self _KafkaPlugin) Call(
 		defer close(output_chan)
 		defer vql_subsystem.RegisterMonitor(ctx, "kafka", args)()
 
-		// Require NETWORK ACL (same as the elastic plugin).
 		if err := vql_subsystem.CheckAccess(scope, acls.NETWORK); err != nil {
 			scope.Log("kafka: %v", err)
 			return
@@ -160,7 +88,6 @@ func (self _KafkaPlugin) Call(
 			return
 		}
 
-		// Apply defaults.
 		if arg.ChunkSize == 0 {
 			arg.ChunkSize = 100
 		}
@@ -171,18 +98,15 @@ func (self _KafkaPlugin) Call(
 			arg.WaitTime = 2
 		}
 		if arg.RequiredAcks == 0 {
-			// segmentio/kafka-go uses int; -1 = RequireAll.
 			arg.RequiredAcks = -1
 		}
 
-		// Build TLS config once; reused across threads.
 		tlsCfg, err := buildTLSConfig(arg)
 		if err != nil {
 			scope.Log("kafka: TLS config error: %v", err)
 			return
 		}
 
-		// Resolve compression codec.
 		codec, err := resolveCompression(arg.Compression)
 		if err != nil {
 			scope.Log("kafka: %v", err)
@@ -190,17 +114,13 @@ func (self _KafkaPlugin) Call(
 		}
 
 		config_obj, _ := artifacts.GetConfig(scope)
-		_ = config_obj // available for future use (e.g. proxy config)
+		_ = config_obj
 
-		// Fan the query output across producer goroutines.
 		row_chan := arg.Query.Eval(ctx, scope)
 		var wg sync.WaitGroup
 		for i := 0; i < int(arg.Threads); i++ {
 			wg.Add(1)
-			go kafkaUploadRows(
-				ctx, scope, output_chan, row_chan,
-				tlsCfg, codec, arg, &wg,
-			)
+			go kafkaUploadRows(ctx, scope, output_chan, row_chan, tlsCfg, codec, arg, &wg)
 		}
 		wg.Wait()
 	}()
@@ -208,7 +128,6 @@ func (self _KafkaPlugin) Call(
 	return output_chan
 }
 
-// kafkaUploadRows drains row_chan in batches and publishes each batch to Kafka.
 func kafkaUploadRows(
 	ctx context.Context,
 	scope vfilter.Scope,
@@ -236,9 +155,7 @@ func kafkaUploadRows(
 		if len(batch) == 0 {
 			return
 		}
-
 		resp := &_KafkaUploadResponse{Sent: len(batch)}
-
 		writeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 
@@ -272,14 +189,11 @@ func kafkaUploadRows(
 				return
 			}
 
-			msg, err := rowToKafkaMessage(row, arg.Topic, scope)
+			msg, err := rowToKafkaMessage(row, arg.Topic)
 			if err != nil {
 				scope.Log("kafka: serialisation error: %v", err)
-
 				select {
-				case output_chan <- &_KafkaUploadResponse{
-					Errors: 1, Error: err.Error(),
-				}:
+				case output_chan <- &_KafkaUploadResponse{Errors: 1, Error: err.Error()}:
 				case <-ctx.Done():
 					return
 				}
@@ -294,20 +208,10 @@ func kafkaUploadRows(
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-// rowToKafkaMessage serialises an ordereddict row to JSON and wraps it in a
-// kafka.Message.  The message key is set to the value of the "_artifact"
-// column when present, giving consumers an easy way to filter by artifact.
-func rowToKafkaMessage(row vfilter.Row, topic string, scope vfilter.Scope) (kafka.Message, error) {
+func rowToKafkaMessage(row vfilter.Row, topic string) (kafka.Message, error) {
 	dict, ok := row.(*ordereddict.Dict)
 	if !ok {
-		// Coerce non-dict rows into an ordereddict so we can serialise them.
 		dict = ordereddict.NewDict()
-		// Best-effort: if the row is a struct or map the JSON encoder will
-		// handle it below.
 	}
 
 	data, err := json.Marshal(dict)
@@ -328,55 +232,32 @@ func rowToKafkaMessage(row vfilter.Row, topic string, scope vfilter.Scope) (kafk
 	}, nil
 }
 
-// newKafkaWriter constructs a segmentio/kafka-go Writer with the supplied
-// TLS config and the args-driven settings.
-func newKafkaWriter(
-	arg *_KafkaPluginArgs,
-	tlsCfg *tls.Config,
-	codec kafka.Compression,
-) *kafka.Writer {
-
+func newKafkaWriter(arg *_KafkaPluginArgs, tlsCfg *tls.Config, codec kafka.Compression) *kafka.Writer {
 	transport := &kafka.Transport{
 		TLS:         tlsCfg,
 		DialTimeout: 10 * time.Second,
 		IdleTimeout: 45 * time.Second,
 	}
 
-	// Attach SASL if credentials were supplied.
-	if arg.SASLUsername != "" {
-		transport.SASL = kafka.Plain{
-			Username: arg.SASLUsername,
-			Password: arg.SASLPassword,
-		}
-	}
-
-	acks := kafka.RequiredAcks(arg.RequiredAcks)
-
 	return &kafka.Writer{
 		Addr:                   kafka.TCP(arg.Brokers...),
 		Topic:                  arg.Topic,
 		Balancer:               &kafka.LeastBytes{},
-		RequiredAcks:           acks,
+		RequiredAcks:           kafka.RequiredAcks(arg.RequiredAcks),
 		Compression:            codec,
 		Transport:              transport,
 		AllowAutoTopicCreation: false,
-		// Batch settings mirror ChunkSize / WaitTime already applied by caller.
-		BatchSize:    int(arg.ChunkSize),
-		BatchTimeout: time.Duration(arg.WaitTime) * time.Second,
+		BatchSize:              int(arg.ChunkSize),
+		BatchTimeout:           time.Duration(arg.WaitTime) * time.Second,
 	}
 }
 
-// buildTLSConfig constructs a *tls.Config from PEM strings.
-// When ClientCert + ClientKey are supplied mTLS is enabled.
-// When RootCA is supplied it is used as the trusted root pool.
-// When neither is supplied and SkipVerify is false, the system pool is used.
 func buildTLSConfig(arg *_KafkaPluginArgs) (*tls.Config, error) {
 	cfg := &tls.Config{
-		InsecureSkipVerify: arg.SkipVerify, // #nosec G402 – user-explicit flag
+		InsecureSkipVerify: arg.SkipVerify, // #nosec G402
 		MinVersion:         tls.VersionTLS12,
 	}
 
-	// Root CA / broker certificate verification.
 	if arg.RootCA != "" {
 		pool, err := parseCertPool(arg.RootCA)
 		if err != nil {
@@ -385,7 +266,6 @@ func buildTLSConfig(arg *_KafkaPluginArgs) (*tls.Config, error) {
 		cfg.RootCAs = pool
 	}
 
-	// Client certificate for mTLS.
 	if arg.ClientCert != "" || arg.ClientKey != "" {
 		if arg.ClientCert == "" || arg.ClientKey == "" {
 			return nil, fmt.Errorf("both client_cert and client_key must be supplied for mTLS")
@@ -397,14 +277,9 @@ func buildTLSConfig(arg *_KafkaPluginArgs) (*tls.Config, error) {
 		cfg.Certificates = []tls.Certificate{cert}
 	}
 
-	// If no TLS material at all was provided we still want encryption but
-	// rely on the system root pool – return a minimal config so callers can
-	// distinguish "no TLS wanted" from "TLS with system roots".
 	return cfg, nil
 }
 
-// parseCertPool decodes one or more PEM-encoded certificates and adds them
-// to a new x509.CertPool.
 func parseCertPool(pemData string) (*x509.CertPool, error) {
 	pool := x509.NewCertPool()
 	data := []byte(pemData)
@@ -429,7 +304,6 @@ func parseCertPool(pemData string) (*x509.CertPool, error) {
 	return pool, nil
 }
 
-// resolveCompression maps a human-readable codec name to a kafka.Compression.
 func resolveCompression(name string) (kafka.Compression, error) {
 	switch name {
 	case "", "none":
@@ -447,23 +321,13 @@ func resolveCompression(name string) (kafka.Compression, error) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Plugin metadata
-// ---------------------------------------------------------------------------
-
 func (self _KafkaPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name: "kafka",
-		Doc: "Upload rows from a query to a Kafka topic. " +
-			"Supports mTLS (client_cert + client_key + root_ca), " +
-			"optional SASL/PLAIN, and pluggable compression.",
+		Name:    "kafka",
+		Doc:     "Upload rows from a query to a Kafka topic using mTLS.",
 		ArgType: type_map.AddType(scope, &_KafkaPluginArgs{}),
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Self-registration
-// ---------------------------------------------------------------------------
 
 func init() {
 	vql_subsystem.RegisterPlugin(&_KafkaPlugin{})
